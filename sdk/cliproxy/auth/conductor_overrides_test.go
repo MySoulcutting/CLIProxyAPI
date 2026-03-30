@@ -113,8 +113,10 @@ type authFallbackExecutor struct {
 
 	mu                sync.Mutex
 	executeCalls      []string
+	countCalls        []string
 	streamCalls       []string
 	executeErrors     map[string]error
+	countErrors       map[string]error
 	streamFirstErrors map[string]error
 }
 
@@ -154,8 +156,15 @@ func (e *authFallbackExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, er
 	return auth, nil
 }
 
-func (e *authFallbackExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	return cliproxyexecutor.Response{}, &Error{HTTPStatus: 500, Message: "not implemented"}
+func (e *authFallbackExecutor) CountTokens(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.mu.Lock()
+	e.countCalls = append(e.countCalls, auth.ID)
+	err := e.countErrors[auth.ID]
+	e.mu.Unlock()
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+	return cliproxyexecutor.Response{Payload: []byte(auth.ID)}, nil
 }
 
 func (e *authFallbackExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
@@ -167,6 +176,14 @@ func (e *authFallbackExecutor) ExecuteCalls() []string {
 	defer e.mu.Unlock()
 	out := make([]string, len(e.executeCalls))
 	copy(out, e.executeCalls)
+	return out
+}
+
+func (e *authFallbackExecutor) CountCalls() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]string, len(e.countCalls))
+	copy(out, e.countCalls)
 	return out
 }
 
@@ -405,6 +422,270 @@ func TestManagerExecuteStream_ModelSupportBadRequestFallsBackAndSuspendsAuth(t *
 	}
 	if state.NextRetryAfter.IsZero() {
 		t.Fatalf("expected bad auth model state cooldown to be set")
+	}
+}
+
+func TestManager_FatalAuthFailure_RemovesAuthAndFallsBackAcrossExecutionModes(t *testing.T) {
+	testCases := []struct {
+		name  string
+		invoke func(*Manager, cliproxyexecutor.Request) (string, error)
+		calls func(*authFallbackExecutor) []string
+	}{
+		{
+			name: "execute",
+			invoke: func(m *Manager, request cliproxyexecutor.Request) (string, error) {
+				resp, err := m.Execute(context.Background(), []string{"claude"}, request, cliproxyexecutor.Options{})
+				return string(resp.Payload), err
+			},
+			calls: func(executor *authFallbackExecutor) []string { return executor.ExecuteCalls() },
+		},
+		{
+			name: "execute_count",
+			invoke: func(m *Manager, request cliproxyexecutor.Request) (string, error) {
+				resp, err := m.ExecuteCount(context.Background(), []string{"claude"}, request, cliproxyexecutor.Options{})
+				return string(resp.Payload), err
+			},
+			calls: func(executor *authFallbackExecutor) []string { return executor.CountCalls() },
+		},
+		{
+			name: "execute_stream",
+			invoke: func(m *Manager, request cliproxyexecutor.Request) (string, error) {
+				streamResult, err := m.ExecuteStream(context.Background(), []string{"claude"}, request, cliproxyexecutor.Options{})
+				if err != nil {
+					return "", err
+				}
+				var payload []byte
+				for chunk := range streamResult.Chunks {
+					if chunk.Err != nil {
+						return "", chunk.Err
+					}
+					payload = append(payload, chunk.Payload...)
+				}
+				return string(payload), nil
+			},
+			calls: func(executor *authFallbackExecutor) []string { return executor.StreamCalls() },
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			m := NewManager(nil, nil, nil)
+			executor := &authFallbackExecutor{
+				id: "claude",
+				executeErrors: map[string]error{
+					"aa-bad-auth": &Error{HTTPStatus: http.StatusUnauthorized, Message: "invalid api key"},
+				},
+				countErrors: map[string]error{
+					"aa-bad-auth": &Error{HTTPStatus: http.StatusUnauthorized, Message: "invalid api key"},
+				},
+				streamFirstErrors: map[string]error{
+					"aa-bad-auth": &Error{HTTPStatus: http.StatusUnauthorized, Message: "invalid api key"},
+				},
+			}
+			m.RegisterExecutor(executor)
+
+			model := "claude-opus-4-6"
+			badAuth := &Auth{ID: "aa-bad-auth", Provider: "claude"}
+			goodAuth := &Auth{ID: "bb-good-auth", Provider: "claude"}
+			registerSchedulerModels(t, "claude", model, badAuth.ID, goodAuth.ID)
+
+			if _, err := m.Register(context.Background(), badAuth); err != nil {
+				t.Fatalf("register bad auth: %v", err)
+			}
+			if _, err := m.Register(context.Background(), goodAuth); err != nil {
+				t.Fatalf("register good auth: %v", err)
+			}
+
+			request := cliproxyexecutor.Request{Model: model}
+			payload, err := tc.invoke(m, request)
+			if err != nil {
+				t.Fatalf("first invoke error = %v, want success", err)
+			}
+			if payload != goodAuth.ID {
+				t.Fatalf("first invoke payload = %q, want %q", payload, goodAuth.ID)
+			}
+
+			if _, ok := m.GetByID(badAuth.ID); ok {
+				t.Fatalf("expected bad auth to be removed")
+			}
+			if models := registry.GetGlobalRegistry().GetModelsForClient(badAuth.ID); len(models) != 0 {
+				t.Fatalf("expected bad auth to be unregistered from model registry, got %d models", len(models))
+			}
+
+			payload, err = tc.invoke(m, request)
+			if err != nil {
+				t.Fatalf("second invoke error = %v, want success", err)
+			}
+			if payload != goodAuth.ID {
+				t.Fatalf("second invoke payload = %q, want %q", payload, goodAuth.ID)
+			}
+
+			got := tc.calls(executor)
+			want := []string{badAuth.ID, goodAuth.ID, goodAuth.ID}
+			if len(got) != len(want) {
+				t.Fatalf("calls = %v, want %v", got, want)
+			}
+			for i := range want {
+				if got[i] != want[i] {
+					t.Fatalf("call %d auth = %q, want %q", i, got[i], want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestManager_FatalAuthFailure_DeletesPersistedAuthRecord(t *testing.T) {
+	store := &countingStore{}
+	m := NewManager(store, nil, nil)
+	executor := &authFallbackExecutor{
+		id: "claude",
+		executeErrors: map[string]error{
+			"aa-bad-auth.json": &Error{HTTPStatus: http.StatusUnauthorized, Message: "invalid api key"},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	model := "claude-opus-4-6"
+	badAuth := &Auth{
+		ID:       "aa-bad-auth.json",
+		Provider: "claude",
+		Metadata: map[string]any{"email": "bad@example.com"},
+	}
+	goodAuth := &Auth{ID: "bb-good-auth", Provider: "claude"}
+	registerSchedulerModels(t, "claude", model, badAuth.ID, goodAuth.ID)
+
+	if _, err := m.Register(context.Background(), badAuth); err != nil {
+		t.Fatalf("register bad auth: %v", err)
+	}
+	if _, err := m.Register(context.Background(), goodAuth); err != nil {
+		t.Fatalf("register good auth: %v", err)
+	}
+
+	resp, err := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if err != nil {
+		t.Fatalf("execute error = %v, want success", err)
+	}
+	if string(resp.Payload) != goodAuth.ID {
+		t.Fatalf("execute payload = %q, want %q", string(resp.Payload), goodAuth.ID)
+	}
+	if got := store.deleteCount.Load(); got != 1 {
+		t.Fatalf("expected 1 Delete call, got %d", got)
+	}
+	deletedIDs := store.DeletedIDs()
+	if len(deletedIDs) != 1 || deletedIDs[0] != badAuth.ID {
+		t.Fatalf("deleted IDs = %v, want [%s]", deletedIDs, badAuth.ID)
+	}
+}
+
+func TestManager_GeminiVirtualChildFatalFailure_RemovesWholeVirtualGroup(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	executor := &authFallbackExecutor{
+		id: "gemini-cli",
+		executeErrors: map[string]error{
+			"cred-a.json::proj-a1": &Error{HTTPStatus: http.StatusUnauthorized, Message: "access token expired"},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	model := "gemini-2.5-pro"
+	primaryA := &Auth{
+		ID:       "cred-a.json",
+		Provider: "gemini-cli",
+		Disabled: true,
+		Status:   StatusDisabled,
+		Attributes: map[string]string{
+			"gemini_virtual_primary": "true",
+			"path":                   "/auth/cred-a.json",
+		},
+		Metadata: map[string]any{"email": "a@example.com"},
+	}
+	badChild := &Auth{
+		ID:       "cred-a.json::proj-a1",
+		Provider: "gemini-cli",
+		Attributes: map[string]string{
+			"runtime_only":           "true",
+			"gemini_virtual_parent":  primaryA.ID,
+			"gemini_virtual_project": "proj-a1",
+			"path":                   "/auth/cred-a.json",
+		},
+		Metadata: map[string]any{"email": "a@example.com", "project_id": "proj-a1", "virtual": true},
+	}
+	siblingChild := &Auth{
+		ID:       "cred-a.json::proj-a2",
+		Provider: "gemini-cli",
+		Attributes: map[string]string{
+			"runtime_only":           "true",
+			"gemini_virtual_parent":  primaryA.ID,
+			"gemini_virtual_project": "proj-a2",
+			"path":                   "/auth/cred-a.json",
+		},
+		Metadata: map[string]any{"email": "a@example.com", "project_id": "proj-a2", "virtual": true},
+	}
+	primaryB := &Auth{
+		ID:       "cred-b.json",
+		Provider: "gemini-cli",
+		Disabled: true,
+		Status:   StatusDisabled,
+		Attributes: map[string]string{
+			"gemini_virtual_primary": "true",
+			"path":                   "/auth/cred-b.json",
+		},
+		Metadata: map[string]any{"email": "b@example.com"},
+	}
+	goodChild := &Auth{
+		ID:       "cred-b.json::proj-b1",
+		Provider: "gemini-cli",
+		Attributes: map[string]string{
+			"runtime_only":           "true",
+			"gemini_virtual_parent":  primaryB.ID,
+			"gemini_virtual_project": "proj-b1",
+			"path":                   "/auth/cred-b.json",
+		},
+		Metadata: map[string]any{"email": "b@example.com", "project_id": "proj-b1", "virtual": true},
+	}
+	registerSchedulerModels(t, "gemini-cli", model, badChild.ID, siblingChild.ID, goodChild.ID)
+
+	for _, auth := range []*Auth{primaryA, badChild, siblingChild, primaryB, goodChild} {
+		if _, err := m.Register(context.Background(), auth); err != nil {
+			t.Fatalf("register %s: %v", auth.ID, err)
+		}
+	}
+
+	resp, err := m.Execute(context.Background(), []string{"gemini-cli"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if err != nil {
+		t.Fatalf("execute error = %v, want success", err)
+	}
+	if string(resp.Payload) != goodChild.ID {
+		t.Fatalf("execute payload = %q, want %q", string(resp.Payload), goodChild.ID)
+	}
+
+	for _, removedID := range []string{primaryA.ID, badChild.ID, siblingChild.ID} {
+		if _, ok := m.GetByID(removedID); ok {
+			t.Fatalf("expected %s to be removed with its virtual group", removedID)
+		}
+	}
+	if _, ok := m.GetByID(goodChild.ID); !ok {
+		t.Fatalf("expected surviving auth %s to remain registered", goodChild.ID)
+	}
+
+	resp, err = m.Execute(context.Background(), []string{"gemini-cli"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if err != nil {
+		t.Fatalf("second execute error = %v, want success", err)
+	}
+	if string(resp.Payload) != goodChild.ID {
+		t.Fatalf("second execute payload = %q, want %q", string(resp.Payload), goodChild.ID)
+	}
+
+	got := executor.ExecuteCalls()
+	want := []string{badChild.ID, goodChild.ID, goodChild.ID}
+	if len(got) != len(want) {
+		t.Fatalf("execute calls = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("execute call %d auth = %q, want %q", i, got[i], want[i])
+		}
 	}
 }
 

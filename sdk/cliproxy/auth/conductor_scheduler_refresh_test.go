@@ -11,7 +11,8 @@ import (
 )
 
 type schedulerProviderTestExecutor struct {
-	provider string
+	provider      string
+	refreshErrors map[string]error
 }
 
 func (e schedulerProviderTestExecutor) Identifier() string { return e.provider }
@@ -25,6 +26,11 @@ func (e schedulerProviderTestExecutor) ExecuteStream(ctx context.Context, auth *
 }
 
 func (e schedulerProviderTestExecutor) Refresh(ctx context.Context, auth *Auth) (*Auth, error) {
+	if auth != nil && e.refreshErrors != nil {
+		if err := e.refreshErrors[auth.ID]; err != nil {
+			return nil, err
+		}
+	}
 	return auth, nil
 }
 
@@ -159,5 +165,52 @@ func TestManager_PickNext_RebuildsSchedulerAfterModelCooldownError(t *testing.T)
 	}
 	if got == nil || got.ID != newAuth.ID {
 		t.Fatalf("pickNext() auth = %v, want %q", got, newAuth.ID)
+	}
+}
+
+func TestManager_RefreshFatalFailure_RemovesAuth(t *testing.T) {
+	ctx := context.Background()
+	store := &countingStore{}
+	manager := NewManager(store, &RoundRobinSelector{}, nil)
+	manager.RegisterExecutor(schedulerProviderTestExecutor{
+		provider: "gemini",
+		refreshErrors: map[string]error{
+			"refresh-fatal-auth.json": &Error{HTTPStatus: http.StatusUnauthorized, Message: "refresh token expired"},
+		},
+	})
+
+	auth := &Auth{
+		ID:       "refresh-fatal-auth.json",
+		Provider: "gemini",
+		Metadata: map[string]any{"email": "refresh@example.com"},
+	}
+	registerSchedulerModels(t, "gemini", "scheduler-refresh-model", auth.ID)
+
+	if _, err := manager.Register(ctx, auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+	manager.RefreshSchedulerEntry(auth.ID)
+
+	manager.refreshAuth(ctx, auth.ID)
+
+	if _, ok := manager.GetByID(auth.ID); ok {
+		t.Fatalf("expected auth to be removed after fatal refresh failure")
+	}
+	if got := store.deleteCount.Load(); got != 1 {
+		t.Fatalf("expected 1 Delete call, got %d", got)
+	}
+	if models := registry.GetGlobalRegistry().GetModelsForClient(auth.ID); len(models) != 0 {
+		t.Fatalf("expected auth to be removed from model registry, got %d models", len(models))
+	}
+	picked, errPick := manager.scheduler.pickSingle(ctx, "gemini", "scheduler-refresh-model", cliproxyexecutor.Options{}, nil)
+	var authErr *Error
+	if !errors.As(errPick, &authErr) || authErr == nil {
+		t.Fatalf("pickSingle() error = %v, want auth_not_found", errPick)
+	}
+	if authErr.Code != "auth_not_found" {
+		t.Fatalf("pickSingle() code = %q, want %q", authErr.Code, "auth_not_found")
+	}
+	if picked != nil {
+		t.Fatalf("pickSingle() auth = %v, want nil", picked)
 	}
 }

@@ -641,8 +641,11 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 			result.RetryAfter = retryAfterFromError(errStream)
-			m.MarkResult(ctx, result)
+			outcome := m.markResult(ctx, result)
 			if isRequestInvalidError(errStream) {
+				return nil, errStream
+			}
+			if outcome.authDeleted {
 				return nil, errStream
 			}
 			lastErr = errStream
@@ -662,7 +665,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				}
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
-				m.MarkResult(ctx, result)
+				m.markResult(ctx, result)
 				discardStreamChunks(streamResult.Chunks)
 				return nil, bootstrapErr
 			}
@@ -673,8 +676,11 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				}
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
-				m.MarkResult(ctx, result)
+				outcome := m.markResult(ctx, result)
 				discardStreamChunks(streamResult.Chunks)
+				if outcome.authDeleted {
+					return nil, bootstrapErr
+				}
 				lastErr = bootstrapErr
 				continue
 			}
@@ -684,8 +690,11 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 			result.RetryAfter = retryAfterFromError(bootstrapErr)
-			m.MarkResult(ctx, result)
+			outcome := m.markResult(ctx, result)
 			discardStreamChunks(streamResult.Chunks)
+			if outcome.authDeleted {
+				return nil, bootstrapErr
+			}
 			return nil, newStreamBootstrapError(bootstrapErr, streamResult.Headers)
 		}
 
@@ -1123,14 +1132,17 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				if ra := retryAfterFromError(errExec); ra != nil {
 					result.RetryAfter = ra
 				}
-				m.MarkResult(execCtx, result)
+				outcome := m.markResult(execCtx, result)
 				if isRequestInvalidError(errExec) {
 					return cliproxyexecutor.Response{}, errExec
 				}
 				authErr = errExec
+				if outcome.authDeleted {
+					break
+				}
 				continue
 			}
-			m.MarkResult(execCtx, result)
+			m.markResult(execCtx, result)
 			return resp, nil
 		}
 		if authErr != nil {
@@ -1201,14 +1213,17 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				if ra := retryAfterFromError(errExec); ra != nil {
 					result.RetryAfter = ra
 				}
-				m.MarkResult(execCtx, result)
+				outcome := m.markResult(execCtx, result)
 				if isRequestInvalidError(errExec) {
 					return cliproxyexecutor.Response{}, errExec
 				}
 				authErr = errExec
+				if outcome.authDeleted {
+					break
+				}
 				continue
 			}
-			m.MarkResult(execCtx, result)
+			m.markResult(execCtx, result)
 			return resp, nil
 		}
 		if authErr != nil {
@@ -1699,10 +1714,23 @@ func waitForCooldown(ctx context.Context, wait time.Duration) error {
 	}
 }
 
+type markResultOutcome struct {
+	authDeleted bool
+}
+
+type hardDeletePlan struct {
+	removed        []*Auth
+	storeDeleteIDs []string
+}
+
 // MarkResult records an execution result and notifies hooks.
 func (m *Manager) MarkResult(ctx context.Context, result Result) {
+	_ = m.markResult(ctx, result)
+}
+
+func (m *Manager) markResult(ctx context.Context, result Result) markResultOutcome {
 	if result.AuthID == "" {
-		return
+		return markResultOutcome{}
 	}
 
 	shouldResumeModel := false
@@ -1711,109 +1739,120 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	clearModelQuota := false
 	setModelQuota := false
 	var authSnapshot *Auth
+	var deletePlan *hardDeletePlan
 
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
-		now := time.Now()
-
-		if result.Success {
-			if result.Model != "" {
-				state := ensureModelState(auth, result.Model)
-				resetModelState(state, now)
-				updateAggregatedAvailability(auth, now)
-				if !hasModelError(auth, now) {
-					auth.LastError = nil
-					auth.StatusMessage = ""
-					auth.Status = StatusActive
-				}
-				auth.UpdatedAt = now
-				shouldResumeModel = true
-				clearModelQuota = true
-			} else {
-				clearAuthStateOnSuccess(auth, now)
-			}
+		if !result.Success && shouldHardDeleteResultError(result.Error) {
+			deletePlan = m.planHardDeleteLocked(result.AuthID)
 		} else {
-			if result.Model != "" {
-				state := ensureModelState(auth, result.Model)
-				state.Unavailable = true
-				state.Status = StatusError
-				state.UpdatedAt = now
-				if result.Error != nil {
-					state.LastError = cloneError(result.Error)
-					state.StatusMessage = result.Error.Message
-					auth.LastError = cloneError(result.Error)
-					auth.StatusMessage = result.Error.Message
-				}
+			now := time.Now()
 
-				statusCode := statusCodeFromResult(result.Error)
-				if isModelSupportResultError(result.Error) {
-					next := now.Add(12 * time.Hour)
-					state.NextRetryAfter = next
-					suspendReason = "model_not_supported"
-					shouldSuspendModel = true
+			if result.Success {
+				if result.Model != "" {
+					state := ensureModelState(auth, result.Model)
+					resetModelState(state, now)
+					updateAggregatedAvailability(auth, now)
+					if !hasModelError(auth, now) {
+						auth.LastError = nil
+						auth.StatusMessage = ""
+						auth.Status = StatusActive
+					}
+					auth.UpdatedAt = now
+					shouldResumeModel = true
+					clearModelQuota = true
 				} else {
-					switch statusCode {
-					case 401:
-						next := now.Add(30 * time.Minute)
-						state.NextRetryAfter = next
-						suspendReason = "unauthorized"
-						shouldSuspendModel = true
-					case 402, 403:
-						next := now.Add(30 * time.Minute)
-						state.NextRetryAfter = next
-						suspendReason = "payment_required"
-						shouldSuspendModel = true
-					case 404:
+					clearAuthStateOnSuccess(auth, now)
+				}
+			} else {
+				if result.Model != "" {
+					state := ensureModelState(auth, result.Model)
+					state.Unavailable = true
+					state.Status = StatusError
+					state.UpdatedAt = now
+					if result.Error != nil {
+						state.LastError = cloneError(result.Error)
+						state.StatusMessage = result.Error.Message
+						auth.LastError = cloneError(result.Error)
+						auth.StatusMessage = result.Error.Message
+					}
+
+					statusCode := statusCodeFromResult(result.Error)
+					if isModelSupportResultError(result.Error) {
 						next := now.Add(12 * time.Hour)
 						state.NextRetryAfter = next
-						suspendReason = "not_found"
+						suspendReason = "model_not_supported"
 						shouldSuspendModel = true
-					case 429:
-						var next time.Time
-						backoffLevel := state.Quota.BackoffLevel
-						if result.RetryAfter != nil {
-							next = now.Add(*result.RetryAfter)
-						} else {
-							cooldown, nextLevel := nextQuotaCooldown(backoffLevel, quotaCooldownDisabledForAuth(auth))
-							if cooldown > 0 {
-								next = now.Add(cooldown)
-							}
-							backoffLevel = nextLevel
-						}
-						state.NextRetryAfter = next
-						state.Quota = QuotaState{
-							Exceeded:      true,
-							Reason:        "quota",
-							NextRecoverAt: next,
-							BackoffLevel:  backoffLevel,
-						}
-						suspendReason = "quota"
-						shouldSuspendModel = true
-						setModelQuota = true
-					case 408, 500, 502, 503, 504:
-						if quotaCooldownDisabledForAuth(auth) {
-							state.NextRetryAfter = time.Time{}
-						} else {
-							next := now.Add(1 * time.Minute)
+					} else {
+						switch statusCode {
+						case 401:
+							next := now.Add(30 * time.Minute)
 							state.NextRetryAfter = next
+							suspendReason = "unauthorized"
+							shouldSuspendModel = true
+						case 402, 403:
+							next := now.Add(30 * time.Minute)
+							state.NextRetryAfter = next
+							suspendReason = "payment_required"
+							shouldSuspendModel = true
+						case 404:
+							next := now.Add(12 * time.Hour)
+							state.NextRetryAfter = next
+							suspendReason = "not_found"
+							shouldSuspendModel = true
+						case 429:
+							var next time.Time
+							backoffLevel := state.Quota.BackoffLevel
+							if result.RetryAfter != nil {
+								next = now.Add(*result.RetryAfter)
+							} else {
+								cooldown, nextLevel := nextQuotaCooldown(backoffLevel, quotaCooldownDisabledForAuth(auth))
+								if cooldown > 0 {
+									next = now.Add(cooldown)
+								}
+								backoffLevel = nextLevel
+							}
+							state.NextRetryAfter = next
+							state.Quota = QuotaState{
+								Exceeded:      true,
+								Reason:        "quota",
+								NextRecoverAt: next,
+								BackoffLevel:  backoffLevel,
+							}
+							suspendReason = "quota"
+							shouldSuspendModel = true
+							setModelQuota = true
+						case 408, 500, 502, 503, 504:
+							if quotaCooldownDisabledForAuth(auth) {
+								state.NextRetryAfter = time.Time{}
+							} else {
+								next := now.Add(1 * time.Minute)
+								state.NextRetryAfter = next
+							}
+						default:
+							state.NextRetryAfter = time.Time{}
 						}
-					default:
-						state.NextRetryAfter = time.Time{}
 					}
+
+					auth.Status = StatusError
+					auth.UpdatedAt = now
+					updateAggregatedAvailability(auth, now)
+				} else {
+					applyAuthFailureState(auth, result.Error, result.RetryAfter, now)
 				}
-
-				auth.Status = StatusError
-				auth.UpdatedAt = now
-				updateAggregatedAvailability(auth, now)
-			} else {
-				applyAuthFailureState(auth, result.Error, result.RetryAfter, now)
 			}
-		}
 
-		_ = m.persist(ctx, auth)
-		authSnapshot = auth.Clone()
+			_ = m.persist(ctx, auth)
+			authSnapshot = auth.Clone()
+		}
 	}
 	m.mu.Unlock()
+
+	if deletePlan != nil {
+		m.applyHardDeletePlan(ctx, deletePlan, result.Error)
+		m.hook.OnResult(ctx, result)
+		return markResultOutcome{authDeleted: true}
+	}
 	if m.scheduler != nil && authSnapshot != nil {
 		m.scheduler.upsertAuth(authSnapshot)
 	}
@@ -1831,6 +1870,339 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 
 	m.hook.OnResult(ctx, result)
+	return markResultOutcome{}
+}
+
+func (m *Manager) planHardDeleteLocked(authID string) *hardDeletePlan {
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return nil
+	}
+	ids := m.collectHardDeleteAuthIDsLocked(authID)
+	if len(ids) == 0 {
+		return nil
+	}
+	plan := &hardDeletePlan{removed: make([]*Auth, 0, len(ids))}
+	seenStoreDelete := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		auth := m.auths[id]
+		if auth == nil {
+			continue
+		}
+		plan.removed = append(plan.removed, auth.Clone())
+		delete(m.auths, id)
+		if shouldDeleteStoredAuth(auth) {
+			deleteID := hardDeleteStoreID(auth)
+			if deleteID != "" {
+				if _, ok := seenStoreDelete[deleteID]; !ok {
+					seenStoreDelete[deleteID] = struct{}{}
+					plan.storeDeleteIDs = append(plan.storeDeleteIDs, deleteID)
+				}
+			}
+		}
+		if m.scheduler != nil {
+			m.scheduler.removeAuth(id)
+		}
+	}
+	if len(plan.removed) == 0 {
+		return nil
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil {
+		cfg = &internalconfig.Config{}
+	}
+	m.rebuildAPIKeyModelAliasLocked(cfg)
+	m.removeModelPoolOffsetsLocked(plan.removed)
+	return plan
+}
+
+func (m *Manager) collectHardDeleteAuthIDsLocked(authID string) []string {
+	auth := m.auths[authID]
+	if auth == nil {
+		return nil
+	}
+	ids := []string{authID}
+	seen := map[string]struct{}{authID: struct{}{}}
+	parentID, pathKey, grouped := geminiVirtualHardDeleteScope(auth)
+	if !grouped {
+		return ids
+	}
+	for id, candidate := range m.auths {
+		if candidate == nil {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		if shouldDeleteGeminiVirtualPeer(candidate, parentID, pathKey) {
+			seen[id] = struct{}{}
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+func (m *Manager) removeModelPoolOffsetsLocked(auths []*Auth) {
+	if m == nil || len(m.modelPoolOffsets) == 0 || len(auths) == 0 {
+		return
+	}
+	prefixes := make([]string, 0, len(auths))
+	seen := make(map[string]struct{}, len(auths))
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		prefix := strings.ToLower(strings.TrimSpace(auth.ID))
+		if prefix == "" {
+			continue
+		}
+		prefix += "|"
+		if _, ok := seen[prefix]; ok {
+			continue
+		}
+		seen[prefix] = struct{}{}
+		prefixes = append(prefixes, prefix)
+	}
+	if len(prefixes) == 0 {
+		return
+	}
+	for key := range m.modelPoolOffsets {
+		keyLower := strings.ToLower(strings.TrimSpace(key))
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(keyLower, prefix) {
+				delete(m.modelPoolOffsets, key)
+				break
+			}
+		}
+	}
+}
+
+func (m *Manager) applyHardDeletePlan(ctx context.Context, plan *hardDeletePlan, resultErr *Error) {
+	if plan == nil || len(plan.removed) == 0 {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	removedIDs := make([]string, 0, len(plan.removed))
+	reg := registry.GetGlobalRegistry()
+	for _, auth := range plan.removed {
+		if auth == nil {
+			continue
+		}
+		removedIDs = append(removedIDs, auth.ID)
+		if reg != nil {
+			reg.UnregisterClient(auth.ID)
+		}
+	}
+	entry := logEntryWithRequestID(ctx)
+	message := "fatal auth failure"
+	if resultErr != nil {
+		if trimmed := strings.TrimSpace(resultErr.Message); trimmed != "" {
+			message = trimmed
+		}
+	}
+	entry.Warnf("removed auth(s) after fatal failure: %s (%s)", strings.Join(removedIDs, ", "), message)
+	if m.store == nil {
+		return
+	}
+	for _, deleteID := range plan.storeDeleteIDs {
+		if err := m.store.Delete(ctx, deleteID); err != nil {
+			entry.WithError(err).Warnf("failed to delete persisted auth %s", deleteID)
+		}
+	}
+}
+
+func geminiVirtualHardDeleteScope(auth *Auth) (parentID string, pathKey string, grouped bool) {
+	if auth == nil || auth.Attributes == nil {
+		return "", "", false
+	}
+	parentID = strings.TrimSpace(auth.Attributes["gemini_virtual_parent"])
+	if parentID == "" && isGeminiVirtualPrimaryAuth(auth) {
+		parentID = strings.TrimSpace(auth.ID)
+	}
+	if parentID == "" {
+		return "", "", false
+	}
+	return parentID, authPathKey(auth), true
+}
+
+func isGeminiVirtualPrimaryAuth(auth *Auth) bool {
+	if auth == nil || auth.Attributes == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(auth.Attributes["gemini_virtual_primary"]), "true")
+}
+
+func authPathKey(auth *Auth) string {
+	if auth == nil || auth.Attributes == nil {
+		return ""
+	}
+	return strings.TrimSpace(auth.Attributes["path"])
+}
+
+func shouldDeleteGeminiVirtualPeer(auth *Auth, parentID string, pathKey string) bool {
+	if auth == nil {
+		return false
+	}
+	if parentID != "" {
+		if strings.TrimSpace(auth.ID) == parentID {
+			return true
+		}
+		if auth.Attributes != nil && strings.TrimSpace(auth.Attributes["gemini_virtual_parent"]) == parentID {
+			return true
+		}
+	}
+	if pathKey == "" || !sameAuthPath(authPathKey(auth), pathKey) {
+		return false
+	}
+	if isGeminiVirtualPrimaryAuth(auth) {
+		return true
+	}
+	return auth.Attributes != nil && strings.TrimSpace(auth.Attributes["gemini_virtual_parent"]) != ""
+}
+
+func sameAuthPath(left string, right string) bool {
+	left = strings.TrimSpace(left)
+	right = strings.TrimSpace(right)
+	if left == "" || right == "" {
+		return false
+	}
+	left = filepath.Clean(left)
+	right = filepath.Clean(right)
+	return left == right || strings.EqualFold(left, right)
+}
+
+func shouldDeleteStoredAuth(auth *Auth) bool {
+	if auth == nil || auth.Metadata == nil {
+		return false
+	}
+	if auth.Attributes != nil && strings.EqualFold(strings.TrimSpace(auth.Attributes["runtime_only"]), "true") {
+		return false
+	}
+	return true
+}
+
+func hardDeleteStoreID(auth *Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if id := strings.TrimSpace(auth.ID); id != "" {
+		return id
+	}
+	if fileName := strings.TrimSpace(auth.FileName); fileName != "" {
+		return fileName
+	}
+	if path := authPathKey(auth); path != "" {
+		return path
+	}
+	return ""
+}
+
+func shouldHardDeleteResultError(err *Error) bool {
+	if err == nil {
+		return false
+	}
+	return shouldHardDeleteAuthFailure(statusCodeFromResult(err), err.Message)
+}
+
+func shouldHardDeleteError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return shouldHardDeleteAuthFailure(statusCodeFromError(err), err.Error())
+}
+
+func shouldHardDeleteAuthFailure(statusCode int, message string) bool {
+	if isModelSupportErrorMessage(message) {
+		return false
+	}
+	if isQuotaLikeFailureMessage(message) {
+		switch statusCode {
+		case http.StatusUnauthorized, http.StatusPaymentRequired:
+			return true
+		default:
+			return false
+		}
+	}
+	switch statusCode {
+	case http.StatusUnauthorized, http.StatusPaymentRequired:
+		return true
+	case http.StatusForbidden:
+		return true
+	case http.StatusBadRequest,
+		http.StatusUnprocessableEntity,
+		http.StatusTooManyRequests,
+		http.StatusRequestTimeout,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout:
+		return false
+	}
+	return isIrrecoverableAuthFailureMessage(message)
+}
+
+func isQuotaLikeFailureMessage(message string) bool {
+	lower := strings.ToLower(strings.TrimSpace(message))
+	if lower == "" {
+		return false
+	}
+	patterns := [...]string{
+		"quota",
+		"rate limit",
+		"too many requests",
+		"insufficient_quota",
+		"resource exhausted",
+		"daily limit",
+		"request limit",
+	}
+	for _, pattern := range patterns {
+		if strings.Contains(lower, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+func isIrrecoverableAuthFailureMessage(message string) bool {
+	lower := strings.ToLower(strings.TrimSpace(message))
+	if lower == "" {
+		return false
+	}
+	patterns := [...]string{
+		"invalid_api_key",
+		"invalid api key",
+		"incorrect api key",
+		"api key is invalid",
+		"api key not valid",
+		"invalid authentication",
+		"invalid credentials",
+		"access token has expired",
+		"access token expired",
+		"token has expired",
+		"token expired",
+		"refresh token is required",
+		"missing refresh token",
+		"refresh token invalid",
+		"refresh token expired",
+		"refresh token revoked",
+		"refresh token reused",
+		"invalid_grant",
+		"credential expired",
+		"credential revoked",
+		"login required",
+		"login expired",
+		"session expired",
+		"re-auth",
+		"reauth",
+	}
+	for _, pattern := range patterns {
+		if strings.Contains(lower, pattern) {
+			return true
+		}
+	}
+	return lower == "unauthorized" || lower == "forbidden"
 }
 
 func ensureModelState(auth *Auth, model string) *ModelState {
@@ -2818,6 +3190,16 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	log.Debugf("refreshed %s, %s, %v", auth.Provider, auth.ID, err)
 	now := time.Now()
 	if err != nil {
+		if shouldHardDeleteError(err) {
+			refreshErr := &Error{Message: err.Error(), HTTPStatus: statusCodeFromError(err)}
+			m.mu.Lock()
+			deletePlan := m.planHardDeleteLocked(id)
+			m.mu.Unlock()
+			if deletePlan != nil {
+				m.applyHardDeletePlan(ctx, deletePlan, refreshErr)
+			}
+			return
+		}
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
 			current.NextRefreshAfter = now.Add(refreshFailureBackoff)
@@ -2842,7 +3224,42 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	updated.NextRefreshAfter = time.Time{}
 	updated.LastError = nil
 	updated.UpdatedAt = now
-	_, _ = m.Update(ctx, updated)
+	m.applyRefreshedAuthIfPresent(ctx, updated)
+}
+
+func (m *Manager) applyRefreshedAuthIfPresent(ctx context.Context, auth *Auth) {
+	if auth == nil || auth.ID == "" {
+		return
+	}
+	m.mu.Lock()
+	current, ok := m.auths[auth.ID]
+	if !ok || current == nil {
+		m.mu.Unlock()
+		return
+	}
+	if !auth.indexAssigned && auth.Index == "" {
+		auth.Index = current.Index
+		auth.indexAssigned = current.indexAssigned
+	}
+	if !current.Disabled && current.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
+		if len(auth.ModelStates) == 0 && len(current.ModelStates) > 0 {
+			auth.ModelStates = current.ModelStates
+		}
+	}
+	auth.EnsureIndex()
+	authClone := auth.Clone()
+	m.auths[auth.ID] = authClone
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil {
+		cfg = &internalconfig.Config{}
+	}
+	m.rebuildAPIKeyModelAliasLocked(cfg)
+	if m.scheduler != nil {
+		m.scheduler.upsertAuth(authClone)
+	}
+	m.mu.Unlock()
+	_ = m.persist(ctx, auth)
+	m.hook.OnAuthUpdated(ctx, auth.Clone())
 }
 
 func (m *Manager) executorFor(provider string) ProviderExecutor {

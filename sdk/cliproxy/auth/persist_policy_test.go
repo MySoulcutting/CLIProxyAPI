@@ -2,12 +2,17 @@ package auth
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 )
 
 type countingStore struct {
-	saveCount atomic.Int32
+	saveCount   atomic.Int32
+	deleteCount atomic.Int32
+
+	mu        sync.Mutex
+	deleteIDs []string
 }
 
 func (s *countingStore) List(context.Context) ([]*Auth, error) { return nil, nil }
@@ -17,7 +22,21 @@ func (s *countingStore) Save(context.Context, *Auth) (string, error) {
 	return "", nil
 }
 
-func (s *countingStore) Delete(context.Context, string) error { return nil }
+func (s *countingStore) Delete(_ context.Context, id string) error {
+	s.deleteCount.Add(1)
+	s.mu.Lock()
+	s.deleteIDs = append(s.deleteIDs, id)
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *countingStore) DeletedIDs() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, len(s.deleteIDs))
+	copy(out, s.deleteIDs)
+	return out
+}
 
 func TestWithSkipPersist_DisablesUpdatePersistence(t *testing.T) {
 	store := &countingStore{}
