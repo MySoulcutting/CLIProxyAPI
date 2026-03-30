@@ -26,5 +26,12 @@ jobs:
           cache: true
       - name: Build
         run: |
-          go build -o test-output ./cmd/server
-          rm -f test-output
+          mkdir -p dist
+          go build -o dist/CLIProxyAPI-linux-amd64 ./cmd/server
+      - name: Upload build artifact
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: CLIProxyAPI-linux-amd64
+          path: dist/CLIProxyAPI-linux-amd64
+          if-no-files-found: error
