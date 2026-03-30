@@ -28,10 +28,18 @@ jobs:
         run: |
           mkdir -p dist
           go build -o dist/CLIProxyAPI-linux-amd64 ./cmd/server
-      - name: Upload build artifact
+          GOOS=windows GOARCH=amd64 go build -o dist/CLIProxyAPI-windows-amd64.exe ./cmd/server
+      - name: Upload Linux artifact
         if: github.event_name == 'push'
         uses: actions/upload-artifact@v4
         with:
           name: CLIProxyAPI-linux-amd64
           path: dist/CLIProxyAPI-linux-amd64
+          if-no-files-found: error
+      - name: Upload Windows artifact
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: CLIProxyAPI-windows-amd64
+          path: dist/CLIProxyAPI-windows-amd64.exe
           if-no-files-found: error
